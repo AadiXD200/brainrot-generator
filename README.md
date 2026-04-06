@@ -1,7 +1,8 @@
 # Brainrot Video Generator — Overlay Mode
 
 Turns Reddit stories into vertical short-form videos (TikTok / Reels / Shorts).
-Gameplay fills the full screen, story is narrated via AI voice, captions appear on top.
+Gameplay fills the full screen, story is narrated via AI voice, captions appear on top (also automatically uploads to your youtube account).
+Check the vids out here - https://www.youtube.com/@Threadfeed/shorts 
 
 ## Pipeline
 
