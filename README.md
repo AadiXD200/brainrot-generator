@@ -1,116 +1,127 @@
-# Brainrot Video Generator — Overlay Mode
+# Brainrot Video Generator
 
-Turns Reddit stories into vertical short-form videos (TikTok / Reels / Shorts).
-Gameplay fills the full screen, story is narrated via AI voice, captions appear on top (also automatically uploads to your youtube account).
+Fully automated Reddit-to-YouTube Shorts pipeline. Run one command and it handles everything — scraping the best stories from Reddit, downloading gameplay footage from YouTube, generating AI voiceover with timed captions, composing the final vertical video, and uploading it directly to your channel.
 
+Check the channel: [Threadfeed Shorts](https://www.youtube.com/@Threadfeed/shorts)
 
-Check the vids out here - https://www.youtube.com/@Threadfeed/shorts 
+---
 
-## Pipeline
+## How it works
 
 ```
-story input → quality eval → TTS → word-timed captions → gameplay → ffmpeg compose → MP4
+Reddit scrape → quality filter → auto-trim → TTS voiceover
+→ sentence-timed captions → gameplay download → hook title card
+→ ffmpeg compose → YouTube Shorts upload
 ```
+
+Every step is automatic. The only thing you set up once is your YouTube OAuth credentials.
+
+---
+
+## Full auto mode
+
+The main feature. One command generates and uploads a batch of videos:
+
+```bash
+# Generate 3 videos from top subreddits and upload to YouTube Shorts
+python overlay_video_generator.py --auto --upload
+
+# Custom subreddits, custom count
+python overlay_video_generator.py --auto --subreddits AITA,tifu,confession --count 5 --upload
+
+# Generate locally without uploading
+python overlay_video_generator.py --auto --count 3
+
+# Custom gameplay style
+python overlay_video_generator.py --auto --gameplay-query "minecraft parkour vertical" --upload
+```
+
+What `--auto` does behind the scenes:
+1. Scrapes top posts from 5 subreddits (AITA, tifu, confession, offmychest, relationship_advice)
+2. Scores every story on hook, drama, clarity, and length — rejects weak ones
+3. Ranks passing stories by score, picks the best N
+4. Downloads gameplay footage from YouTube via yt-dlp (cached after first run, rotated randomly)
+5. Generates TTS audio with sentence-level caption timing
+6. Renders a 2.5s hook title card over gameplay
+7. Composes the final 9:16 video with burned-in captions and optional background music
+8. Uploads to YouTube Shorts with auto-generated title, description, and tags
+
+---
 
 ## Setup
 
-### 1. Install system deps
+### 1. System dependencies
 ```bash
 brew install ffmpeg
+pip install yt-dlp
 ```
 
-### 2. Install Python deps
+### 2. Python dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Add gameplay footage
-Drop a vertical (or any) `.mp4` into `assets/gameplay/`. Subway Surfers, Minecraft parkour, etc.
-The generator will scale + crop it to 1080×1920 automatically.
+### 3. YouTube upload (one-time OAuth setup)
 
-### 4. (Optional) Set API keys
+1. Go to [Google Cloud Console](https://console.cloud.google.com)
+2. Create a project → enable **YouTube Data API v3**
+3. Create OAuth 2.0 credentials (Desktop app) → download as `client_secrets.json`
+4. Place `client_secrets.json` in the project root
+5. First `--upload` run opens a browser for consent — token is cached after that
+
+### 4. Optional: smarter story scoring
 ```bash
-# For LLM-based story scoring (falls back to rules-based if not set)
-export OPENAI_API_KEY=sk-...
-
-# For scraping Reddit directly
-export REDDIT_CLIENT_ID=...
-export REDDIT_CLIENT_SECRET=...
+export OPENAI_API_KEY=sk-...   # uses GPT-4o-mini for scoring instead of rules-based
 ```
 
 ---
 
-## Usage
+## All commands
 
 ```bash
-# From a text file
-python overlay_video_generator.py --story input/stories/my_story.txt
+# ── Full auto ──────────────────────────────────────────────────────
+python overlay_video_generator.py --auto
+python overlay_video_generator.py --auto --upload
+python overlay_video_generator.py --auto --subreddits AITA,tifu --count 5 --upload
 
-# From a JSON file
-python overlay_video_generator.py --story input/stories/story.json
-
-# Paste directly in terminal
+# ── Single story ───────────────────────────────────────────────────
+python overlay_video_generator.py --story input/stories/story.txt
+python overlay_video_generator.py --reddit https://reddit.com/r/AITA/comments/...
 python overlay_video_generator.py --paste
 
-# From a Reddit URL
-python overlay_video_generator.py --reddit https://reddit.com/r/AmItheAsshole/comments/...
+# ── Scrape one subreddit ───────────────────────────────────────────
+python overlay_video_generator.py --scrape AmItheAsshole --count 10
 
-# Specify gameplay clip
-python overlay_video_generator.py --story story.txt --gameplay assets/gameplay/subway.mp4
+# ── Batch from folder ──────────────────────────────────────────────
+python overlay_video_generator.py --batch input/stories/ --count 20
 
-# Skip quality check
-python overlay_video_generator.py --story story.txt --no-eval
-
-# Force generate even if story scores low
-python overlay_video_generator.py --story story.txt --force
-
-# List available voices
-python overlay_video_generator.py --list-voices
+# ── Options ────────────────────────────────────────────────────────
+--gameplay-query "subway surfers vertical"   # custom gameplay search
+--music assets/music/lofi.mp3               # background music
+--music-vol 0.06                            # music volume (default 0.08)
+--voice en-US-GuyNeural                     # different TTS voice
+--max-dur 60                                # cap video at 60s
+--no-hook                                   # skip title card
+--force                                     # ignore quality filter
+--no-eval                                   # skip scoring entirely
+--list-voices                               # show all available voices
 ```
 
 ---
 
-## Story input formats
+## Story quality filter
 
-**Plain text** (`.txt`) — just the story body, filename becomes the title.
+Every scraped story is automatically scored before a video is generated:
 
-**JSON** (`.json`):
-```json
-{
-  "title": "My roommate stole my food",
-  "text": "I found out my roommate...",
-  "subreddit": "AmItheAsshole",
-  "url": "https://reddit.com/..."
-}
-```
-
----
-
-## Story quality scoring
-
-Before generating, every story is scored on:
-
-| Dimension | What it checks |
+| Dimension | What it measures |
 |---|---|
-| Hook | Is the first sentence immediately grabbing? |
-| Drama | Conflict, emotional stakes, tension keywords |
-| Clarity | Readable aloud? No heavy Reddit jargon? |
-| Length | 80–350 words = ideal for 30–90s content |
+| Hook | Does the first sentence grab immediately? |
+| Drama | Conflict, tension, emotional stakes |
+| Clarity | Clean to narrate aloud — no heavy Reddit jargon |
+| Length | 80–350 words = ideal 30–90s video |
 
-Stories scoring below **6.5/10** are rejected by default. Use `--force` to override.
-Set `OPENAI_API_KEY` for smarter LLM-based scoring; otherwise falls back to rule-based.
-
----
-
-## Output
-
-Files land in:
-```
-output/
-  videos/     → final .mp4 ready to post
-  audio/      → narration .mp3
-  subtitles/  → .ass subtitle file
-```
+Stories below **6.5/10** are skipped. The top-scoring stories are generated first.
+Set `OPENAI_API_KEY` for GPT-4o-mini scoring; otherwise uses the built-in rule engine.
 
 ---
 
@@ -118,29 +129,26 @@ output/
 
 ```
 brainrot-generator/
-├── overlay_video_generator.py   ← all core logic lives here
+├── overlay_video_generator.py   ← entire pipeline in one file
+├── client_secrets.json          ← YouTube OAuth (you add this)
 ├── requirements.txt
 ├── assets/
-│   ├── gameplay/                ← drop .mp4 clips here
-│   └── fonts/                   ← optional custom fonts
+│   ├── gameplay/                ← auto-downloaded and cached here
+│   └── music/                   ← drop .mp3 for background music
 ├── input/
-│   └── stories/                 ← .txt or .json story files
+│   └── stories/                 ← manual .txt / .json inputs
 ├── output/
-│   ├── videos/
-│   ├── audio/
-│   └── subtitles/
+│   ├── videos/                  ← final MP4s
+│   ├── audio/                   ← narration files
+│   └── subtitles/               ← .ass caption files
 └── temp/
 ```
 
 ---
 
-## Extending later
+## Requirements
 
-| Feature | Where to add |
-|---|---|
-| Reddit batch scraper | Add `scrape_subreddit()` to story input section |
-| Word-level captions | `build_caption_chunks()` already uses word boundaries — shrink `max_words` |
-| Background music | Add `-i music.mp3 -filter_complex amix` to ffmpeg cmd in `compose_overlay_video()` |
-| Split-screen mode | New file: `splitscreen_video_generator.py` |
-| Batch mode | Loop `run_pipeline()` over a folder of story files |
-| Hook title card | Prepend a 2s title TextClip before gameplay in ffmpeg filter |
+- Python 3.11+
+- ffmpeg (`brew install ffmpeg`)
+- yt-dlp (`pip install yt-dlp`)
+- Internet connection (Reddit JSON API + YouTube search, no API keys needed for scraping)

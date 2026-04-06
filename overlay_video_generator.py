@@ -4,14 +4,21 @@ overlay_video_generator.py
 Brainrot Video Generator — Overlay Mode
 
 Pipeline:
-  story input → evaluate → auto-trim → TTS → hook card → captions → gameplay → compose → MP4
+  story input → evaluate → auto-trim → TTS → hook card → captions → gameplay → compose → upload → MP4
 
 Usage:
+  # Single story
   python overlay_video_generator.py --story input/stories/my_story.txt
   python overlay_video_generator.py --reddit https://reddit.com/r/AmItheAsshole/comments/...
+  python overlay_video_generator.py --paste
+
+  # Scrape & batch
   python overlay_video_generator.py --scrape AITA --count 5
   python overlay_video_generator.py --batch input/stories/ --count 10
-  python overlay_video_generator.py --paste
+
+  # Full auto — scrapes Reddit, downloads gameplay, generates, uploads to YouTube
+  python overlay_video_generator.py --auto
+  python overlay_video_generator.py --auto --subreddits AITA,tifu,confession --count 5 --upload
 """
 
 import os, sys, json, re, math, asyncio, subprocess, shutil, argparse, textwrap, time, urllib.request
@@ -801,7 +808,229 @@ def run_batch(stories: list[Story], **kwargs) -> list[Path]:
     return outputs
 
 
-# ── 12. CLI ───────────────────────────────────────────────────────────────────
+# ── 12. YouTube upload ────────────────────────────────────────────────────────
+
+YOUTUBE_SCOPES    = ["https://www.googleapis.com/auth/youtube.upload"]
+YOUTUBE_TOKEN     = ROOT / ".youtube_token.json"
+YOUTUBE_SECRETS   = ROOT / "client_secrets.json"
+
+# Subreddits known to produce good brainrot content
+DEFAULT_SUBREDDITS = ["AmItheAsshole", "tifu", "confession", "offmychest", "relationship_advice"]
+
+SHORTS_DESCRIPTION_TEMPLATE = """{title}
+
+#{subreddit} #reddit #redditstories #storytime #shorts #brainrot #aita"""
+
+
+def _get_youtube_service():
+    """
+    Authenticate with YouTube Data API v3.
+    First run opens a browser for OAuth consent — token is cached after that.
+    Requires client_secrets.json in the project root (from Google Cloud Console).
+    """
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        import googleapiclient.discovery
+    except ImportError:
+        raise RuntimeError(
+            "YouTube upload deps missing.\n"
+            "Run: pip install google-api-python-client google-auth-oauthlib google-auth-httplib2"
+        )
+
+    if not YOUTUBE_SECRETS.exists():
+        raise FileNotFoundError(
+            f"Missing {YOUTUBE_SECRETS}\n"
+            "Create a project at console.cloud.google.com, enable YouTube Data API v3,\n"
+            "download OAuth 2.0 client credentials as client_secrets.json and place it here."
+        )
+
+    creds = None
+    if YOUTUBE_TOKEN.exists():
+        creds = Credentials.from_authorized_user_file(str(YOUTUBE_TOKEN), YOUTUBE_SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(str(YOUTUBE_SECRETS), YOUTUBE_SCOPES)
+            creds = flow.run_local_server(port=0)
+        YOUTUBE_TOKEN.write_text(creds.to_json())
+
+    return googleapiclient.discovery.build("youtube", "v3", credentials=creds)
+
+
+def upload_to_youtube(video_path: Path, story: Story) -> Optional[str]:
+    """
+    Upload a video to YouTube as a Short.
+    Returns the video URL on success, None on failure.
+    Vertical videos under 60s are auto-classified as Shorts by YouTube.
+    """
+    print("\n  Uploading to YouTube...")
+    try:
+        youtube = _get_youtube_service()
+        import googleapiclient.http
+
+        description = SHORTS_DESCRIPTION_TEMPLATE.format(
+            title     = story.title,
+            subreddit = story.subreddit or "reddit",
+        )
+
+        body = {
+            "snippet": {
+                "title":       story.title[:100],
+                "description": description,
+                "tags":        ["reddit", "shorts", "brainrot", "storytime",
+                                story.subreddit or "aita", "redditstories"],
+                "categoryId":  "22",   # People & Blogs
+            },
+            "status": {
+                "privacyStatus":          "public",
+                "selfDeclaredMadeForKids": False,
+            },
+        }
+
+        media = googleapiclient.http.MediaFileUpload(
+            str(video_path),
+            mimetype   = "video/mp4",
+            resumable  = True,
+            chunksize  = 1024 * 1024 * 5,   # 5 MB chunks
+        )
+
+        request  = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                pct = int(status.progress() * 100)
+                print(f"\r  Uploading... {pct}%", end="", flush=True)
+
+        video_id  = response["id"]
+        video_url = f"https://youtube.com/shorts/{video_id}"
+        print(f"\r  Uploaded → {video_url}      ")
+        return video_url
+
+    except Exception as e:
+        print(f"  Upload failed: {e}")
+        return None
+
+
+# ── 13. Full auto mode ────────────────────────────────────────────────────────
+
+def run_auto(
+    subreddits:    list[str] = None,
+    count:         int       = 3,
+    upload:        bool      = False,
+    cfg:           RenderConfig = None,
+    gameplay_query: Optional[str] = None,
+) -> list[dict]:
+    """
+    Fully automated pipeline:
+      1. Scrape top posts from multiple subreddits
+      2. Score every story — skip weak ones
+      3. Download gameplay footage from YouTube (cached after first run)
+      4. Generate video for each passing story
+      5. Optionally upload each video to YouTube Shorts
+
+    Returns a list of result dicts with story title, video path, and upload URL.
+    """
+    if subreddits is None:
+        subreddits = DEFAULT_SUBREDDITS
+    if cfg is None:
+        cfg = RenderConfig()
+
+    print(f"\n{'='*60}")
+    print(f"  AUTO MODE")
+    print(f"  Subreddits : {', '.join(subreddits)}")
+    print(f"  Target     : {count} videos")
+    print(f"  Upload     : {'YouTube Shorts' if upload else 'local only'}")
+    print(f"{'='*60}\n")
+
+    # ── Step 1: collect stories from all subreddits
+    all_stories = []
+    per_sub     = max(1, (count * 3) // len(subreddits))   # over-fetch to allow for rejects
+    for sub in subreddits:
+        try:
+            stories = scrape_subreddit(sub, count=per_sub, sort="top", time_filter="week")
+            all_stories.extend(stories)
+        except Exception as e:
+            print(f"  Warning: failed to scrape r/{sub} — {e}")
+
+    if not all_stories:
+        print("  No stories fetched. Check your internet connection.")
+        return []
+
+    # ── Step 2: score and rank all stories
+    print(f"\n  Scoring {len(all_stories)} stories...")
+    scored = []
+    for story in all_stories:
+        story  = clean_story_text(story)
+        result = evaluate_story(story)
+        if result.recommended:
+            scored.append((result.score, story))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    selected = [s for _, s in scored[:count]]
+
+    print(f"  {len(selected)}/{len(all_stories)} stories passed quality filter")
+    if not selected:
+        print("  No stories met the quality threshold.")
+        return []
+
+    # ── Step 3: pre-fetch one gameplay clip (shared across all videos)
+    print(f"\n  Fetching gameplay footage...")
+    try:
+        gp_path = find_gameplay_video(auto_fetch=True)
+    except Exception as e:
+        print(f"  Gameplay fetch failed: {e}")
+        return []
+
+    # ── Step 4 & 5: generate + optionally upload
+    results = []
+    for i, story in enumerate(selected, 1):
+        print(f"\n[{i}/{len(selected)}] {story.title[:70]}")
+        try:
+            video_path = run_pipeline(
+                story         = story,
+                gameplay_path = str(gp_path),
+                cfg           = cfg,
+                skip_eval     = True,   # already evaluated above
+                hook          = True,
+            )
+            if not video_path:
+                continue
+
+            upload_url = None
+            if upload:
+                upload_url = upload_to_youtube(video_path, story)
+
+            results.append({
+                "title":      story.title,
+                "subreddit":  story.subreddit,
+                "video":      str(video_path),
+                "url":        upload_url,
+            })
+
+        except Exception as e:
+            print(f"  ERROR: {e} — skipping")
+
+    # ── Summary
+    print(f"\n{'='*60}")
+    print(f"  AUTO MODE COMPLETE")
+    print(f"  Generated : {len(results)} videos")
+    if upload:
+        uploaded = [r for r in results if r["url"]]
+        print(f"  Uploaded  : {len(uploaded)} to YouTube Shorts")
+    print(f"{'='*60}")
+    for r in results:
+        status = f"→ {r['url']}" if r.get("url") else "→ local only"
+        print(f"  {r['title'][:55]:<55}  {status}")
+
+    return results
+
+
+# ── 14. CLI ───────────────────────────────────────────────────────────────────
 
 def main():
     check_dependencies()
@@ -821,24 +1050,27 @@ def main():
     )
 
     src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--story",   metavar="FILE",      help=".txt or .json story file")
+    src.add_argument("--auto",    action="store_true",  help="Full auto mode: scrape → generate → upload")
+    src.add_argument("--story",   metavar="FILE",       help=".txt or .json story file")
     src.add_argument("--reddit",  metavar="URL",        help="Reddit post URL (no credentials needed)")
     src.add_argument("--scrape",  metavar="SUBREDDIT",  help="Scrape top posts from a subreddit")
     src.add_argument("--batch",   metavar="FOLDER",     help="Run on all .txt/.json files in a folder")
     src.add_argument("--paste",   action="store_true",  help="Paste story interactively")
 
-    parser.add_argument("--gameplay",        metavar="FILE",  default=None, help="Specific gameplay video file")
-    parser.add_argument("--gameplay-query", metavar="QUERY", default=None, help="YouTube search query for gameplay (e.g. 'subway surfers vertical')")
-    parser.add_argument("--music",      metavar="FILE",  default=None,  help="Background music file")
-    parser.add_argument("--music-vol",  type=float,      default=0.08,  help="Music volume 0.0–1.0 (default: 0.08)")
-    parser.add_argument("--count",      type=int,        default=10,    help="Stories to fetch/batch (default: 10)")
-    parser.add_argument("--voice",      default="en-US-AriaNeural")
-    parser.add_argument("--font-size",  type=int,        default=72)
-    parser.add_argument("--max-dur",    type=int,        default=90)
-    parser.add_argument("--no-eval",    action="store_true")
-    parser.add_argument("--force",      action="store_true")
-    parser.add_argument("--no-hook",    action="store_true",            help="Skip hook title card")
-    parser.add_argument("--list-voices", action="store_true")
+    parser.add_argument("--subreddits",     default=None,    help="Comma-separated subreddits for --auto (default: AITA,tifu,confession,offmychest,relationship_advice)")
+    parser.add_argument("--upload",         action="store_true", help="Upload generated videos to YouTube Shorts")
+    parser.add_argument("--gameplay",       metavar="FILE",  default=None, help="Specific gameplay video file")
+    parser.add_argument("--gameplay-query", metavar="QUERY", default=None, help="YouTube search query for gameplay")
+    parser.add_argument("--music",          metavar="FILE",  default=None, help="Background music file")
+    parser.add_argument("--music-vol",      type=float,      default=0.08, help="Music volume 0.0–1.0 (default: 0.08)")
+    parser.add_argument("--count",          type=int,        default=3,    help="Number of videos to generate (default: 3)")
+    parser.add_argument("--voice",          default="en-US-AriaNeural")
+    parser.add_argument("--font-size",      type=int,        default=72)
+    parser.add_argument("--max-dur",        type=int,        default=90)
+    parser.add_argument("--no-eval",        action="store_true")
+    parser.add_argument("--force",          action="store_true")
+    parser.add_argument("--no-hook",        action="store_true", help="Skip hook title card")
+    parser.add_argument("--list-voices",    action="store_true")
 
     args = parser.parse_args()
 
@@ -872,6 +1104,17 @@ def main():
         force         = args.force,
         hook          = not args.no_hook,
     )
+
+    if args.auto:
+        subs = [s.strip() for s in args.subreddits.split(",")] if args.subreddits else None
+        run_auto(
+            subreddits     = subs,
+            count          = args.count,
+            upload         = args.upload,
+            cfg            = cfg,
+            gameplay_query = args.gameplay_query,
+        )
+        return
 
     if args.story:
         story = load_story_from_json(args.story) if args.story.endswith(".json") else load_story_from_file(args.story)
