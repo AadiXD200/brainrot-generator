@@ -424,19 +424,84 @@ def write_ass_file(chunks: list[CaptionChunk], cfg: RenderConfig,
 
 # ── 6. Gameplay handling ──────────────────────────────────────────────────────
 
-def find_gameplay_video(requested: Optional[str] = None) -> Path:
+# Search queries rotated randomly so videos vary between runs
+GAMEPLAY_SEARCHES = [
+    "subway surfers gameplay no commentary vertical",
+    "minecraft parkour gameplay satisfying vertical",
+    "geometry dash gameplay vertical no commentary",
+    "temple run gameplay vertical no commentary",
+    "stack ball gameplay satisfying vertical",
+    "helix jump gameplay satisfying vertical",
+    "infinite runner mobile gameplay vertical",
+    "satisfying minecraft build timelapse vertical",
+]
+
+
+def fetch_gameplay_from_youtube(query: Optional[str] = None) -> Path:
+    """
+    Download a gameplay clip from YouTube using yt-dlp.
+    Picks a random search query from GAMEPLAY_SEARCHES if none given.
+    Caches to assets/gameplay/ so it's reused on the next run.
+    """
+    if not shutil.which("yt-dlp"):
+        raise RuntimeError(
+            "yt-dlp not installed.\n"
+            "Run: pip install yt-dlp   or   brew install yt-dlp"
+        )
+
+    import random
+    search = query or random.choice(GAMEPLAY_SEARCHES)
+    slug   = re.sub(r'[^a-z0-9]+', '_', search.lower())[:40]
+    out    = GAMEPLAY / f"{slug}.mp4"
+
+    if out.exists():
+        print(f"  Using cached gameplay: {out.name}")
+        return out
+
+    print(f"  Downloading gameplay: \"{search}\"")
+    cmd = [
+        "yt-dlp",
+        f"ytsearch1:{search}",          # grab the top result
+        "--format", "bestvideo[ext=mp4][height<=1920]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
+        "--output", str(out),
+        "--no-playlist",
+        "--quiet", "--no-warnings",
+        "--max-filesize", "200M",        # skip huge files
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not out.exists():
+        raise RuntimeError(f"yt-dlp failed:\n{result.stderr[-500:]}")
+
+    print(f"  Saved → {out.name}")
+    return out
+
+
+def find_gameplay_video(requested: Optional[str] = None, auto_fetch: bool = True) -> Path:
+    """
+    Return a gameplay video path. Priority:
+      1. Explicitly requested path
+      2. Cached file in assets/gameplay/
+      3. Auto-download from YouTube (if auto_fetch=True)
+    """
     if requested:
         p = Path(requested)
         if p.exists():
             return p
         raise FileNotFoundError(f"Gameplay video not found: {requested}")
+
     candidates = list(GAMEPLAY.glob("*.mp4")) + list(GAMEPLAY.glob("*.mov"))
-    if not candidates:
-        raise FileNotFoundError(
-            f"No gameplay videos in {GAMEPLAY}/\n"
-            "Drop a .mp4 there (e.g. subway_surfers.mp4) and re-run."
-        )
-    return candidates[0]
+    if candidates:
+        import random
+        return random.choice(candidates)   # rotate through cached clips
+
+    if auto_fetch:
+        return fetch_gameplay_from_youtube()
+
+    raise FileNotFoundError(
+        f"No gameplay videos in {GAMEPLAY}/\n"
+        "Run with --auto-gameplay or drop a .mp4 there manually."
+    )
 
 
 def find_music_file(requested: Optional[str] = None) -> Optional[Path]:
@@ -669,7 +734,7 @@ def run_pipeline(
 
     # 6. Gameplay + optional hook card
     print("\n[6/7] Preparing video assets...")
-    gp_path    = find_gameplay_video(gameplay_path)
+    gp_path    = find_gameplay_video(gameplay_path, auto_fetch=True)
     music_file = find_music_file(music_path)
     gp_dur     = get_video_duration(gp_path)
     print(f"  Gameplay: {gp_path.name} ({gp_dur:.1f}s)")
@@ -762,7 +827,8 @@ def main():
     src.add_argument("--batch",   metavar="FOLDER",     help="Run on all .txt/.json files in a folder")
     src.add_argument("--paste",   action="store_true",  help="Paste story interactively")
 
-    parser.add_argument("--gameplay",   metavar="FILE",  default=None)
+    parser.add_argument("--gameplay",        metavar="FILE",  default=None, help="Specific gameplay video file")
+    parser.add_argument("--gameplay-query", metavar="QUERY", default=None, help="YouTube search query for gameplay (e.g. 'subway surfers vertical')")
     parser.add_argument("--music",      metavar="FILE",  default=None,  help="Background music file")
     parser.add_argument("--music-vol",  type=float,      default=0.08,  help="Music volume 0.0–1.0 (default: 0.08)")
     parser.add_argument("--count",      type=int,        default=10,    help="Stories to fetch/batch (default: 10)")
@@ -792,8 +858,14 @@ def main():
         music_volume = args.music_vol,
     )
 
+    # Pre-fetch gameplay from YouTube if a query was given
+    resolved_gameplay = args.gameplay
+    if args.gameplay_query and not resolved_gameplay:
+        print(f"\nFetching gameplay: \"{args.gameplay_query}\"")
+        resolved_gameplay = str(fetch_gameplay_from_youtube(args.gameplay_query))
+
     pipeline_kwargs = dict(
-        gameplay_path = args.gameplay,
+        gameplay_path = resolved_gameplay,
         music_path    = args.music,
         cfg           = cfg,
         skip_eval     = args.no_eval,
